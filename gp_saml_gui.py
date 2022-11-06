@@ -17,6 +17,7 @@ if gi is None:
     raise ImportError("Either gi (PyGObject) or pgi module is required.")
 
 import argparse
+import asyncio
 import pprint
 import urllib3
 import urllib
@@ -24,13 +25,17 @@ import requests
 import xml.etree.ElementTree as ET
 import ssl
 import tempfile
+from playwright.async_api import async_playwright, Request, Response
 
+from asyncio.queues import Queue
+from dataclasses import dataclass
 from operator import setitem
 from os import path, dup2, execvp
 from shlex import quote
 from sys import stderr, platform
 from binascii import a2b_base64, b2a_base64
 from urllib.parse import urlparse, urlencode
+
 
 class SAMLLoginView:
     def __init__(self, uri, html=None, verbose=False, cookies=None, verify=True, user_agent=None):
@@ -141,6 +146,85 @@ class SAMLLoginView:
             self.success = True
             Gtk.main_quit()
 
+
+@dataclass
+class Res:
+    """Dummy class to match fields of SAMLLoginView"""
+    success = False
+    closed = False
+    fail_reason = ""
+    saml_result = {}
+
+
+async def run_playwright(uri, html=None, verbose=False, cookies=None, ignore_https_errors=False, user_agent=None, user_data_dir=None):
+    queue: Queue[Res] = Queue(maxsize=1)
+    if cookies:
+        print("Warn: ignoring cookies. use user_data_dir")
+
+    async with async_playwright() as pw:
+        if user_data_dir is None:
+            browser = await pw.chromium.launch(channel="msedge", headless=False)
+            browserctx = await browser.new_context(ignore_https_errors=ignore_https_errors, user_agent=user_agent)
+        else:
+            if verbose:
+                print(f"using user data dir {user_data_dir}")
+            browserctx = await pw.chromium.launch_persistent_context(user_data_dir, channel="msedge", headless=False, ignore_https_errors=ignore_https_errors, user_agent=user_agent)
+            browser = browserctx.browser
+            if verbose:
+                print(browserctx)
+        page = await browserctx.new_page()
+
+        def is_saml_resp(resp: Response):
+            return resp.status == 200 and "prelogin-cookie" in resp.headers
+
+        async def on_resp(resp: Response):
+            if 400 <= resp.status <= 600:
+                res = Res()
+                res.fail_reason = f"Error {resp.status_text}: {resp.text}"
+                await queue.put(res)
+                return
+            if not is_saml_resp(resp):
+                return
+
+            res = Res()
+            res.saml_result["server"] = urlparse(resp.url).netloc
+            for hdr, val in resp.headers.items():
+                if hdr.startswith("saml") or hdr in ('prelogin-cookie', 'portal-userauthcookie'):
+                    res.saml_result[hdr] = val
+
+            res.success = True
+            await queue.put(res)
+
+        async def on_req_fail(req: Request):
+            res = Res()
+            res.fail_reason = f"req failed {req.url}: {req.failure}"
+            await queue.put(res)
+
+        page.on("response", on_resp)
+        page.on("requestfailed", on_req_fail)
+
+        if uri is not None:
+            await page.goto(uri)
+        elif isinstance(html, str):
+            await page.set_content(html)
+        else:
+            raise Exception("unreachable. no url or html provided.")
+        # wait for 120 seconds
+        res = await asyncio.wait_for(queue.get(), timeout=1)
+        await page.close()
+        await browserctx.close()
+        if browser is not None:
+            await browser.close()
+        return res
+
+
+def playwright_login(*args, **kwargs):
+    res = asyncio.run(run_playwright(*args, **kwargs))
+    if res.fail_reason:
+        raise Exception(res.fail_reason)
+    return res
+
+
 class TLSAdapter(requests.adapters.HTTPAdapter):
     '''Adapt to older TLS stacks that would raise errors otherwise.
 
@@ -196,7 +280,6 @@ def parse_args(args = None):
     x.add_argument('-v','--verbose', default=1, action='count', help='Increase verbosity of explanatory output to stderr')
     x.add_argument('-q','--quiet', dest='verbose', action='store_const', const=0, help='Reduce verbosity to a minimum')
     x = p.add_mutually_exclusive_group()
-    x.add_argument('-x','--external', action='store_true', help='Launch external browser (for debugging)')
     x.add_argument('-P','--pkexec-openconnect', action='store_const', dest='exec', const='pkexec', help='Use PolicyKit to exec openconnect')
     x.add_argument('-S','--sudo-openconnect', action='store_const', dest='exec', const='sudo', help='Use sudo to exec openconnect')
     g.add_argument('-u','--uri', action='store_true', help='Treat server as the complete URI of the SAML entry point, rather than GlobalProtect server')
@@ -205,6 +288,10 @@ def parse_args(args = None):
                    help='Extra form field(s) to pass to include in the login query string (e.g. "-f magic-cookie-value=deadbeef01234567")')
     p.add_argument('--allow-insecure-crypto', dest='insecure', action='store_true',
                    help='Allow use of insecure renegotiation or ancient 3DES and RC4 ciphers')
+    g = p.add_argument_group("External browser")
+    g.add_argument('-x','--external', action='store_true', help='Launch external browser and auth using playwright')
+    g.add_argument('-d', '--user-data-dir', help="Path to user dir. If not provided, will create a temp profile")
+
     p.add_argument('--user-agent', '--useragent', default='PAN GlobalProtect',
                    help='Use the provided string as the HTTP User-Agent header (default is %(default)r, as used by OpenConnect)')
     p.add_argument('openconnect_extra', nargs='*', help="Extra arguments to include in output OpenConnect command-line")
@@ -290,20 +377,16 @@ def main(args = None):
         else:
             p.error("Unknown SAML method (%s)" % sam)
 
-    # launch external browser for debugging
-    if args.external:
-        print("Got SAML %s, opening external browser for debugging..." % sam, file=stderr)
-        import webbrowser
-        if html:
-            uri = 'data:text/html;base64,' + b2a_base64(html.encode()).decode()
-        webbrowser.open(uri)
-        raise SystemExit
-
     # spawn WebKit view to do SAML interactive login
     if args.verbose:
         print("Got SAML %s, opening browser..." % sam, file=stderr)
-    slv = SAMLLoginView(uri, html, verbose=args.verbose, cookies=args.cookies, verify=args.verify, user_agent=args.user_agent)
-    Gtk.main()
+
+    if args.external:
+        print(uri)
+        slv = playwright_login(uri, html, verbose=args.verbose, cookies=args.cookies, ignore_https_errors=not args.verify, user_agent=args.user_agent, user_data_dir=args.user_data_dir)
+    else:
+        slv = SAMLLoginView(uri, html, verbose=args.verbose, cookies=args.cookies, verify=args.verify, user_agent=args.user_agent)
+        Gtk.main()
     if slv.closed:
         print("Login window closed by user.", file=stderr)
         p.exit(1)
@@ -311,7 +394,7 @@ def main(args = None):
         p.error('''Login window closed without producing SAML cookies.''')
 
     # extract response and convert to OpenConnect command-line
-    un = slv.saml_result.get('saml-username')
+    un = slv.saml_result['saml-username']
     server = slv.saml_result.get('server', args.server)
 
     for cn, ifh in (('prelogin-cookie','gateway'), ('portal-userauthcookie','portal')):
