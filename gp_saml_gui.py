@@ -156,13 +156,17 @@ class Res:
     saml_result = {}
 
 
-async def run_playwright(uri, html=None, verbose=False, cookies=None, ignore_https_errors=False, user_agent=None, user_data_dir=None):
+async def run_playwright(uri, html=None, verbose=False, cookies=None, ignore_https_errors=False, user_agent=None, cdp_endpoint=None, user_data_dir=None):
     queue: Queue[Res] = Queue(maxsize=1)
     if cookies:
         print("Warn: ignoring cookies. use user_data_dir")
 
     async with async_playwright() as pw:
-        if user_data_dir is None:
+        if cdp_endpoint:
+            browser = await pw.chromium.connect_over_cdp(cdp_endpoint)
+            assert browser.is_connected, f"No browser found at cdp endpoint {cdp_endpoint}"
+            browserctx = browser.contexts[0]
+        elif user_data_dir is None:
             browser = await pw.chromium.launch(channel="msedge", headless=False)
             browserctx = await browser.new_context(ignore_https_errors=ignore_https_errors, user_agent=user_agent)
         else:
@@ -210,7 +214,7 @@ async def run_playwright(uri, html=None, verbose=False, cookies=None, ignore_htt
         else:
             raise Exception("unreachable. no url or html provided.")
         # wait for 120 seconds
-        res = await asyncio.wait_for(queue.get(), timeout=1)
+        res = await asyncio.wait_for(queue.get(), timeout=120)
         await page.close()
         await browserctx.close()
         if browser is not None:
@@ -288,9 +292,17 @@ def parse_args(args = None):
                    help='Extra form field(s) to pass to include in the login query string (e.g. "-f magic-cookie-value=deadbeef01234567")')
     p.add_argument('--allow-insecure-crypto', dest='insecure', action='store_true',
                    help='Allow use of insecure renegotiation or ancient 3DES and RC4 ciphers')
-    g = p.add_argument_group("External browser")
-    g.add_argument('-x','--external', action='store_true', help='Launch external browser and auth using playwright')
-    g.add_argument('-d', '--user-data-dir', help="Path to user dir. If not provided, will create a temp profile")
+
+    g = p.add_argument_group("External browser (only msedge supported for now)", description="Specify how to open browser with pre-loaded data.\n" +
+        "Option1 - If using chromium-based browser, you can start the browser with '--remote-debugging-port' and pass the url to --cdp-endpoint here. We will connect to the existing session.\n" +
+        "Option2 - You can provide --user-data-dir and we will use the Default profile to launch a new browser session. Note that edge only allows one session " +
+        "per profile, so you'll need to close existing windows before starting this script if using this option.\n" +
+        "Option3 - If nothing is provided, we will create a temp profile")
+    g.add_argument('-x','--external', action='store_true', help='Launch external browser and auth using playwright. Otherwise use GTK webview.')
+    # g.add_argument('-b','--browser-channel', help="playwright channel of browser to use", default="msedge", choices=todo)
+    x = g.add_mutually_exclusive_group()
+    x.add_argument('--cdp-endpoint', help="Chrome Debugging Protocol endpoint to connect to existing browser session.")
+    x.add_argument('--user-data-dir', help="Path to user dir. If not provided, will create a temp profile")
 
     p.add_argument('--user-agent', '--useragent', default='PAN GlobalProtect',
                    help='Use the provided string as the HTTP User-Agent header (default is %(default)r, as used by OpenConnect)')
@@ -383,7 +395,7 @@ def main(args = None):
 
     if args.external:
         print(uri)
-        slv = playwright_login(uri, html, verbose=args.verbose, cookies=args.cookies, ignore_https_errors=not args.verify, user_agent=args.user_agent, user_data_dir=args.user_data_dir)
+        slv = playwright_login(uri, html, verbose=args.verbose, cookies=args.cookies, ignore_https_errors=not args.verify, user_agent=args.user_agent, cdp_endpoint=args.cdp_endpoint, user_data_dir=args.user_data_dir)
     else:
         slv = SAMLLoginView(uri, html, verbose=args.verbose, cookies=args.cookies, verify=args.verify, user_agent=args.user_agent)
         Gtk.main()
